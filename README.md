@@ -15,6 +15,7 @@ nhan_yyyymmdd_hhmmss_yyyymmdd_hhmmss.m4a
 - Lưu danh sách bản ghi local bằng `SharedPreferences`.
 - Lưu password HorusDrive bằng `flutter_secure_storage`.
 - Tự upload sau khi dừng ghi âm; bản ghi lỗi có thể bấm upload lại.
+- Tạo/lấy link chia sẻ cho từng file âm thanh và copy link ngay trong app.
 - Nghe lại bản ghi ngay trong app.
 - Hiển thị sóng âm live khi đang ghi.
 - Khoá font/leading ổn định hơn cho các máy MIUI/Xiaomi.

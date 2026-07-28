@@ -6,10 +6,15 @@ import 'package:http/http.dart' as http;
 import 'app_models.dart';
 
 class HorusUploadResult {
-  const HorusUploadResult({required this.remotePath, required this.statusCode});
+  const HorusUploadResult({
+    required this.remotePath,
+    required this.statusCode,
+    this.shareLink,
+  });
 
   final String remotePath;
   final int statusCode;
+  final String? shareLink;
 }
 
 class HorusDriveException implements Exception {
@@ -67,6 +72,31 @@ class HorusDriveService {
     throw lastError ?? HorusDriveException('Không kết nối được HorusDrive');
   }
 
+  Future<String> getRecordingLink({
+    required HorusSettings settings,
+    required RecordingItem recording,
+  }) async {
+    if (!settings.hasUploadCredentials) {
+      throw HorusDriveException('Chưa cấu hình HorusDrive');
+    }
+
+    final folderSegments = _splitRemoteFolder(settings.remoteFolder);
+    final shareLink = await _getOrCreateShareLink(settings, [
+      ...folderSegments,
+      recording.fileName,
+    ]);
+
+    if (shareLink != null && shareLink.isNotEmpty) {
+      return shareLink;
+    }
+
+    if (recording.remotePath != null && recording.remotePath!.isNotEmpty) {
+      return recording.remotePath!;
+    }
+
+    throw HorusDriveException('Chưa lấy được link cho file này');
+  }
+
   Future<HorusUploadResult> uploadRecording({
     required HorusSettings settings,
     required RecordingItem recording,
@@ -106,9 +136,13 @@ class HorusDriveService {
           );
         }
 
+        final remoteSegments = [...folderSegments, recording.fileName];
+        final shareLink = await _getOrCreateShareLink(settings, remoteSegments);
+
         return HorusUploadResult(
           remotePath: remoteUri.toString(),
           statusCode: response.statusCode,
+          shareLink: shareLink,
         );
       } on HorusDriveException catch (error) {
         lastError = error;
@@ -151,6 +185,60 @@ class HorusDriveService {
     }
   }
 
+  Future<String?> _getOrCreateShareLink(
+    HorusSettings settings,
+    List<String> remotePathSegments,
+  ) async {
+    final existingLink = await _findShareLink(settings, remotePathSegments);
+    if (existingLink != null) {
+      return existingLink;
+    }
+
+    final createUri = _buildOcsSharesUri(settings);
+    final request = http.Request('POST', createUri)
+      ..headers.addAll(_ocsHeaders(settings))
+      ..body = Uri(
+        queryParameters: {
+          'path': _sharePath(remotePathSegments),
+          'shareType': '3',
+          'permissions': '1',
+        },
+      ).query;
+
+    final streamed = await _client.send(request);
+    final response = await http.Response.fromStream(streamed);
+    if (!_isSuccess(response.statusCode)) {
+      return _findShareLink(settings, remotePathSegments);
+    }
+
+    return _shareUrlFromOcs(response.body) ??
+        _findShareLink(settings, remotePathSegments);
+  }
+
+  Future<String?> _findShareLink(
+    HorusSettings settings,
+    List<String> remotePathSegments,
+  ) async {
+    final uri = _buildOcsSharesUri(
+      settings,
+      queryParameters: {
+        'format': 'json',
+        'path': _sharePath(remotePathSegments),
+        'reshares': 'true',
+      },
+    );
+    final request = http.Request('GET', uri)
+      ..headers.addAll(_ocsHeaders(settings, includeContentType: false));
+
+    final streamed = await _client.send(request);
+    final response = await http.Response.fromStream(streamed);
+    if (!_isSuccess(response.statusCode)) {
+      return null;
+    }
+
+    return _shareUrlFromOcs(response.body);
+  }
+
   Uri _buildDavUri(
     HorusSettings settings, {
     required _WebDavEndpoint endpoint,
@@ -173,6 +261,30 @@ class HorusDriveService {
     return server.replace(
       pathSegments: [...serverSegments, ...endpointSegments, ...pathSegments],
       query: null,
+      fragment: null,
+    );
+  }
+
+  Uri _buildOcsSharesUri(
+    HorusSettings settings, {
+    Map<String, String> queryParameters = const {'format': 'json'},
+  }) {
+    final server = _parseServer(settings.serverUrl);
+    final serverSegments = server.pathSegments
+        .where((segment) => segment.isNotEmpty)
+        .toList(growable: false);
+    return server.replace(
+      pathSegments: [
+        ...serverSegments,
+        'ocs',
+        'v2.php',
+        'apps',
+        'files_sharing',
+        'api',
+        'v1',
+        'shares',
+      ],
+      queryParameters: queryParameters,
       fragment: null,
     );
   }
@@ -215,6 +327,68 @@ class HorusDriveService {
     return headers;
   }
 
+  Map<String, String> _ocsHeaders(
+    HorusSettings settings, {
+    bool includeContentType = true,
+  }) {
+    final headers = {
+      ..._headers(settings),
+      'OCS-APIRequest': 'true',
+      'Accept': 'application/json',
+    };
+    if (includeContentType) {
+      headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    }
+    return headers;
+  }
+
+  String _sharePath(List<String> pathSegments) {
+    return '/${pathSegments.map((segment) => segment.trim()).join('/')}';
+  }
+
+  String? _shareUrlFromOcs(String body) {
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(body);
+    } catch (_) {
+      return null;
+    }
+    if (decoded is! Map) {
+      return null;
+    }
+
+    final ocs = decoded['ocs'];
+    if (ocs is! Map) {
+      return null;
+    }
+
+    return _shareUrlFromData(ocs['data']);
+  }
+
+  String? _shareUrlFromData(Object? data) {
+    if (data is Map) {
+      final url = data['url'];
+      if (url is String && url.isNotEmpty) {
+        return url;
+      }
+      final nestedData = data['data'];
+      if (nestedData != null) {
+        return _shareUrlFromData(nestedData);
+      }
+    }
+
+    if (data is List) {
+      for (final item in data) {
+        final url = _shareUrlFromData(item);
+        if (url != null && url.isNotEmpty) {
+          return url;
+        }
+      }
+    }
+
+    return null;
+  }
+
   List<_WebDavEndpoint> _candidateEndpoints(HorusSettings settings) {
     if (settings.username.trim().isEmpty) {
       return const [_WebDavEndpoint.webdav];
@@ -224,7 +398,7 @@ class HorusDriveService {
 
   bool _canTryFallbackEndpoint(HorusDriveException error) {
     return switch (error.statusCode) {
-      401 || 403 || 404 => true,
+      401 || 403 || 404 || 409 => true,
       _ => false,
     };
   }

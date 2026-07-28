@@ -106,6 +106,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
   String? _loadedPlaybackId;
   String? _playingRecordingId;
   final Set<String> _uploadingIds = {};
+  final Set<String> _linkingIds = {};
 
   HorusDriveService get _drive => _driveService ??= HorusDriveService();
 
@@ -209,12 +210,15 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       return;
     }
 
-    final label = _selectedLabel;
+    final label = await _pickRecordingLabel();
     if (label == null) {
-      _showSnack('Cần có ít nhất một nhãn');
       return;
     }
 
+    if (!mounted) {
+      return;
+    }
+    setState(() => _selectedLabelId = label.id);
     setState(() => _busy = true);
 
     try {
@@ -275,6 +279,34 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
         setState(() => _busy = false);
       }
     }
+  }
+
+  Future<LabelItem?> _pickRecordingLabel() async {
+    final picked = await showDialog<LabelItem>(
+      context: context,
+      builder: (context) {
+        return _SelectRecordingLabelDialog(
+          labels: _labels,
+          initialLabelId: _selectedLabel?.id,
+          newLabelId: () => _newId(),
+        );
+      },
+    );
+    if (picked == null) {
+      return null;
+    }
+
+    final labelExists = _labels.any((label) => label.id == picked.id);
+    if (!labelExists) {
+      final next = [..._labels, picked];
+      await _localStore.saveLabels(next);
+      if (!mounted) {
+        return picked;
+      }
+      setState(() => _labels = next);
+    }
+
+    return picked;
   }
 
   Future<void> _stopRecording() async {
@@ -471,6 +503,53 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
     });
   }
 
+  Future<void> _copyRecordingLink(RecordingItem recording) async {
+    if (_linkingIds.contains(recording.id)) {
+      return;
+    }
+
+    final existingLink = recording.shareLink ?? recording.remotePath;
+    if (recording.shareLink != null && recording.shareLink!.isNotEmpty) {
+      await _copyText(recording.shareLink!, 'Đã copy link âm thanh');
+      return;
+    }
+
+    if (!_settings.hasUploadCredentials) {
+      if (existingLink != null && existingLink.isNotEmpty) {
+        await _copyText(existingLink, 'Đã copy link WebDAV');
+        return;
+      }
+      _showSnack('Cần cấu hình HorusDrive để lấy link');
+      return;
+    }
+
+    setState(() => _linkingIds.add(recording.id));
+    try {
+      final link = await _drive.getRecordingLink(
+        settings: _settings,
+        recording: recording,
+      );
+      final updated = recording.copyWith(shareLink: link);
+      await _replaceRecording(updated);
+      await _copyText(link, 'Đã copy link âm thanh');
+    } catch (error) {
+      if (existingLink != null && existingLink.isNotEmpty) {
+        await _copyText(existingLink, 'Đã copy link WebDAV');
+      } else {
+        _showSnack('Chưa lấy được link: ${_friendlyError(error)}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _linkingIds.remove(recording.id));
+      }
+    }
+  }
+
+  Future<void> _copyText(String text, String message) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    _showSnack(message);
+  }
+
   Future<void> _uploadRecording(
     RecordingItem recording, {
     bool showSuccess = false,
@@ -484,6 +563,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
         uploadError: 'Chưa cấu hình HorusDrive',
         clearUploadedAt: true,
         clearRemotePath: true,
+        clearShareLink: true,
       );
       await _replaceRecording(updated);
       if (showSuccess) {
@@ -504,6 +584,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       final updated = recording.copyWith(
         uploadedAt: DateTime.now(),
         remotePath: result.remotePath,
+        shareLink: result.shareLink ?? result.remotePath,
         clearUploadError: true,
       );
       await _replaceRecording(updated);
@@ -515,6 +596,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
         uploadError: _friendlyError(error),
         clearUploadedAt: true,
         clearRemotePath: true,
+        clearShareLink: true,
       );
       await _replaceRecording(updated);
       _showSnack('Chưa tải lên được: ${_friendlyError(error)}');
@@ -1202,6 +1284,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
   Widget _buildRecordingCard(BuildContext context, RecordingItem recording) {
     final scheme = Theme.of(context).colorScheme;
     final uploading = _uploadingIds.contains(recording.id);
+    final linking = _linkingIds.contains(recording.id);
     final playbackLoaded = _loadedPlaybackId == recording.id;
     final playbackPlaying = _playingRecordingId == recording.id;
     final duration = playbackLoaded && _playbackDuration > Duration.zero
@@ -1348,6 +1431,21 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
                         ? null
                         : () => _uploadRecording(recording, showSuccess: true),
                     icon: const Icon(Icons.cloud_upload_outlined),
+                  ),
+                if (recording.isUploaded ||
+                    recording.shareLink != null ||
+                    recording.remotePath != null)
+                  IconButton(
+                    tooltip: 'Copy link âm thanh',
+                    onPressed: linking
+                        ? null
+                        : () => _copyRecordingLink(recording),
+                    icon: linking
+                        ? const SizedBox.square(
+                            dimension: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.link_outlined),
                   ),
                 IconButton(
                   tooltip: 'Xoá bản ghi local',
@@ -1512,6 +1610,179 @@ class _StatusPill extends StatelessWidget {
   }
 }
 
+class _SelectRecordingLabelDialog extends StatefulWidget {
+  const _SelectRecordingLabelDialog({
+    required this.labels,
+    required this.initialLabelId,
+    required this.newLabelId,
+  });
+
+  final List<LabelItem> labels;
+  final String? initialLabelId;
+  final String Function() newLabelId;
+
+  @override
+  State<_SelectRecordingLabelDialog> createState() =>
+      _SelectRecordingLabelDialogState();
+}
+
+class _SelectRecordingLabelDialogState
+    extends State<_SelectRecordingLabelDialog> {
+  late final TextEditingController _newLabelController;
+  late List<LabelItem> _labels;
+  String? _selectedLabelId;
+  String? _newLabelError;
+
+  @override
+  void initState() {
+    super.initState();
+    _newLabelController = TextEditingController();
+    _labels = [...widget.labels];
+    final initialExists = _labels.any(
+      (label) => label.id == widget.initialLabelId,
+    );
+    _selectedLabelId = initialExists
+        ? widget.initialLabelId!
+        : _labels.isEmpty
+        ? null
+        : _labels.first.id;
+  }
+
+  @override
+  void dispose() {
+    _newLabelController.dispose();
+    super.dispose();
+  }
+
+  void _addLabel() {
+    final name = _newLabelController.text.trim();
+    if (name.isEmpty) {
+      setState(() => _newLabelError = 'Nhập tên nhãn');
+      return;
+    }
+
+    final normalized = name.toLowerCase();
+    final duplicated = _labels.any(
+      (label) => label.name.trim().toLowerCase() == normalized,
+    );
+    if (duplicated) {
+      setState(() => _newLabelError = 'Nhãn đã tồn tại');
+      return;
+    }
+
+    final label = LabelItem(id: widget.newLabelId(), name: name);
+    setState(() {
+      _labels = [..._labels, label];
+      _selectedLabelId = label.id;
+      _newLabelController.clear();
+      _newLabelError = null;
+    });
+  }
+
+  LabelItem? get _selectedLabel {
+    final selectedLabelId = _selectedLabelId;
+    if (selectedLabelId == null || _labels.isEmpty) {
+      return null;
+    }
+    return _labels.firstWhere(
+      (label) => label.id == selectedLabelId,
+      orElse: () => _labels.first,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Chọn nhãn ghi âm'),
+      contentPadding: const EdgeInsets.fromLTRB(0, 12, 0, 0),
+      content: SizedBox(
+        width: 360,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              height: _labels.isEmpty
+                  ? 56
+                  : math.min(_labels.length * 56.0, 280.0),
+              child: _labels.isEmpty
+                  ? Center(
+                      child: Text(
+                        'Chưa có nhãn',
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    )
+                  : RadioGroup<String>(
+                      groupValue: _selectedLabelId,
+                      onChanged: (value) {
+                        if (value == null) {
+                          return;
+                        }
+                        setState(() => _selectedLabelId = value);
+                      },
+                      child: ListView(
+                        children: [
+                          for (final label in _labels)
+                            RadioListTile<String>(
+                              value: label.id,
+                              title: Text(label.name),
+                            ),
+                        ],
+                      ),
+                    ),
+            ),
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _newLabelController,
+                      decoration: InputDecoration(
+                        labelText: 'Nhãn mới',
+                        errorText: _newLabelError,
+                      ),
+                      textInputAction: TextInputAction.done,
+                      onChanged: (_) {
+                        if (_newLabelError != null) {
+                          setState(() => _newLabelError = null);
+                        }
+                      },
+                      onSubmitted: (_) => _addLabel(),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton.filledTonal(
+                    tooltip: 'Thêm nhãn',
+                    onPressed: _addLabel,
+                    icon: const Icon(Icons.add),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Hủy'),
+        ),
+        FilledButton.icon(
+          onPressed: _selectedLabel == null
+              ? null
+              : () => Navigator.of(context).pop(_selectedLabel),
+          icon: const Icon(Icons.mic),
+          label: const Text('OK'),
+        ),
+      ],
+    );
+  }
+}
+
 class _LabelDialog extends StatefulWidget {
   const _LabelDialog({
     required this.title,
@@ -1570,7 +1841,7 @@ class _LabelDialogState extends State<_LabelDialog> {
       actions: [
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Huỷ'),
+          child: const Text('Hủy'),
         ),
         FilledButton(onPressed: _submit, child: const Text('Lưu')),
       ],

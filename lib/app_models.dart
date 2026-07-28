@@ -1,16 +1,7 @@
-const defaultHorusServerUrl = String.fromEnvironment(
-  'HORUS_SERVER_URL',
-  defaultValue: 'https://drive.horusvn.com',
-);
-const defaultHorusUsername = String.fromEnvironment(
-  'HORUS_USERNAME',
-  defaultValue: 'hieunt',
-);
+const defaultHorusServerUrl = String.fromEnvironment('HORUS_SERVER_URL', defaultValue: 'https://drive.horusvn.com');
+const defaultHorusUsername = String.fromEnvironment('HORUS_USERNAME', defaultValue: '');
 const defaultHorusPassword = String.fromEnvironment('HORUS_PASSWORD');
-const defaultHorusFolder = String.fromEnvironment(
-  'HORUS_FOLDER',
-  defaultValue: 'RecordHorus',
-);
+const defaultHorusFolder = String.fromEnvironment('HORUS_FOLDER', defaultValue: 'RecordHorus');
 
 enum HorusAuthMode {
   basic('basic'),
@@ -21,10 +12,7 @@ enum HorusAuthMode {
   final String code;
 
   static HorusAuthMode fromCode(String? code) {
-    return HorusAuthMode.values.firstWhere(
-      (mode) => mode.code == code,
-      orElse: () => HorusAuthMode.basic,
-    );
+    return HorusAuthMode.values.firstWhere((mode) => mode.code == code, orElse: () => HorusAuthMode.basic);
   }
 }
 
@@ -43,10 +31,7 @@ class LabelItem {
   }
 
   factory LabelItem.fromJson(Map<String, Object?> json) {
-    return LabelItem(
-      id: json['id'] as String? ?? '',
-      name: json['name'] as String? ?? '',
-    );
+    return LabelItem(id: json['id'] as String? ?? '', name: json['name'] as String? ?? '');
   }
 }
 
@@ -60,6 +45,7 @@ class RecordingItem {
     required this.fileName,
     this.uploadedAt,
     this.remotePath,
+    this.shareLink,
     this.uploadError,
   });
 
@@ -71,6 +57,7 @@ class RecordingItem {
   final String fileName;
   final DateTime? uploadedAt;
   final String? remotePath;
+  final String? shareLink;
   final String? uploadError;
 
   bool get isUploaded => uploadedAt != null && uploadError == null;
@@ -93,9 +80,11 @@ class RecordingItem {
     String? fileName,
     DateTime? uploadedAt,
     String? remotePath,
+    String? shareLink,
     String? uploadError,
     bool clearUploadedAt = false,
     bool clearRemotePath = false,
+    bool clearShareLink = false,
     bool clearUploadError = false,
   }) {
     return RecordingItem(
@@ -107,6 +96,7 @@ class RecordingItem {
       fileName: fileName ?? this.fileName,
       uploadedAt: clearUploadedAt ? null : uploadedAt ?? this.uploadedAt,
       remotePath: clearRemotePath ? null : remotePath ?? this.remotePath,
+      shareLink: clearShareLink ? null : shareLink ?? this.shareLink,
       uploadError: clearUploadError ? null : uploadError ?? this.uploadError,
     );
   }
@@ -121,6 +111,7 @@ class RecordingItem {
       'fileName': fileName,
       'uploadedAt': uploadedAt?.toIso8601String(),
       'remotePath': remotePath,
+      'shareLink': shareLink,
       'uploadError': uploadError,
     };
   }
@@ -129,16 +120,13 @@ class RecordingItem {
     return RecordingItem(
       id: json['id'] as String? ?? '',
       label: json['label'] as String? ?? '',
-      startedAt:
-          DateTime.tryParse(json['startedAt'] as String? ?? '') ??
-          DateTime.fromMillisecondsSinceEpoch(0),
-      endedAt:
-          DateTime.tryParse(json['endedAt'] as String? ?? '') ??
-          DateTime.fromMillisecondsSinceEpoch(0),
+      startedAt: DateTime.tryParse(json['startedAt'] as String? ?? '') ?? DateTime.fromMillisecondsSinceEpoch(0),
+      endedAt: DateTime.tryParse(json['endedAt'] as String? ?? '') ?? DateTime.fromMillisecondsSinceEpoch(0),
       filePath: json['filePath'] as String? ?? '',
       fileName: json['fileName'] as String? ?? '',
       uploadedAt: DateTime.tryParse(json['uploadedAt'] as String? ?? ''),
       remotePath: json['remotePath'] as String?,
+      shareLink: json['shareLink'] as String?,
       uploadError: json['uploadError'] as String?,
     );
   }
@@ -183,12 +171,7 @@ class HorusSettings {
   }
 
   Map<String, Object?> toJson() {
-    return {
-      'serverUrl': serverUrl,
-      'username': username,
-      'remoteFolder': remoteFolder,
-      'authMode': authMode.code,
-    };
+    return {'serverUrl': serverUrl, 'username': username, 'remoteFolder': remoteFolder, 'authMode': authMode.code};
   }
 
   factory HorusSettings.fromJson(Map<String, Object?> json) {
