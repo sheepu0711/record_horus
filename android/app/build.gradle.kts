@@ -39,6 +39,11 @@ android {
     }
 }
 
+dependencies {
+    // NotificationCompat & ContextCompat used by RecordingService.
+    implementation("androidx.core:core-ktx:1.13.1")
+}
+
 flutter {
     source = "../.."
 }

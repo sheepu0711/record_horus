@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
@@ -25,19 +26,14 @@ class HorusRecorderApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final scheme = ColorScheme.fromSeed(
-      seedColor: const Color(0xFF006C67),
-      surface: Colors.white,
-    );
+    final scheme = ColorScheme.fromSeed(seedColor: const Color(0xFF006C67), surface: Colors.white);
 
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Record Horus',
       builder: (context, child) {
         return DefaultTextHeightBehavior(
-          textHeightBehavior: const TextHeightBehavior(
-            leadingDistribution: TextLeadingDistribution.even,
-          ),
+          textHeightBehavior: const TextHeightBehavior(leadingDistribution: TextLeadingDistribution.even),
           child: child ?? const SizedBox.shrink(),
         );
       },
@@ -47,15 +43,9 @@ class HorusRecorderApp extends StatelessWidget {
         fontFamilyFallback: _stableFontFallback,
         colorScheme: scheme,
         scaffoldBackgroundColor: const Color(0xFFF6F8FA),
-        appBarTheme: const AppBarTheme(
-          centerTitle: false,
-          elevation: 0,
-          scrolledUnderElevation: 0,
-        ),
+        appBarTheme: const AppBarTheme(centerTitle: false, elevation: 0, scrolledUnderElevation: 0),
         inputDecorationTheme: const InputDecorationTheme(
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.all(Radius.circular(8)),
-          ),
+          border: OutlineInputBorder(borderRadius: BorderRadius.all(Radius.circular(8))),
         ),
       ),
       home: const RecorderHomePage(),
@@ -83,6 +73,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
   StreamSubscription<Duration>? _playbackPositionSubscription;
   StreamSubscription<Duration?>? _playbackDurationSubscription;
   Timer? _elapsedTimer;
+  final _recordingClock = Stopwatch();
 
   List<LabelItem> _labels = const [];
   List<RecordingItem> _recordings = const [];
@@ -108,6 +99,11 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
   final Set<String> _uploadingIds = {};
   final Set<String> _linkingIds = {};
 
+  // Notification Android / Live Activity iOS.
+  static const _recordingControlChannel = MethodChannel('com.example.record_horus/recording_control');
+  static const _recordingActionChannel = EventChannel('com.example.record_horus/recording_actions');
+  StreamSubscription<dynamic>? _notificationActionSubscription;
+
   HorusDriveService get _drive => _driveService ??= HorusDriveService();
 
   AudioPlayer get _player => _audioPlayer ??= _createPlayer();
@@ -120,17 +116,59 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       if (!mounted) {
         return;
       }
+      if (state == RecordState.stop && !_busy && _tempRecordingPath != null &&
+          defaultTargetPlatform == TargetPlatform.iOS) {
+        unawaited(_stopRecording());
+        return;
+      }
       setState(() {
         _isRecording = state != RecordState.stop;
         _isPaused = state == RecordState.pause;
       });
+      if (state == RecordState.record) {
+        _recordingClock.start();
+      } else {
+        _recordingClock.stop();
+      }
+      if ((defaultTargetPlatform == TargetPlatform.iOS) && !_busy && _tempRecordingPath != null && state != RecordState.stop) {
+        unawaited(_showRecordingNotification(paused: _isPaused, label: _selectedLabel?.name ?? 'Chung'));
+      }
     });
+    if (Platform.isAndroid) {
+      _notificationActionSubscription = _recordingActionChannel.receiveBroadcastStream().listen((event) {
+        if (event is String) {
+          unawaited(_handleNotificationAction(event));
+        }
+      });
+    } else if (defaultTargetPlatform == TargetPlatform.iOS) {
+      _recordingControlChannel.setMethodCallHandler((call) async {
+        if (call.method != 'performAction') {
+          throw MissingPluginException();
+        }
+        final arguments = Map<String, dynamic>.from(call.arguments as Map);
+        if (arguments['recordingId'] != _tempRecordingPath || _busy) {
+          return false;
+        }
+        await _handleNotificationAction(arguments['action'] as String);
+        return switch (arguments['action']) {
+          'pause' => _isRecording && _isPaused,
+          'resume' => _isRecording && !_isPaused,
+          'stop' || 'cancel' => !_isRecording,
+          _ => false,
+        };
+      });
+      unawaited(_recordingControlChannel.invokeMethod<void>('ready'));
+    }
     unawaited(_loadAppState());
   }
 
   @override
   void dispose() {
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      _recordingControlChannel.setMethodCallHandler(null);
+    }
     _elapsedTimer?.cancel();
+    unawaited(_notificationActionSubscription?.cancel());
     unawaited(_recordStateSubscription?.cancel());
     unawaited(_amplitudeSubscription?.cancel());
     unawaited(_playbackStateSubscription?.cancel());
@@ -189,7 +227,14 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
 
   Future<void> _loadAppState() async {
     final labels = await _localStore.loadLabels();
-    final recordings = await _localStore.loadRecordings();
+    var recordings = await _localStore.loadRecordings();
+    if ((defaultTargetPlatform == TargetPlatform.iOS) && recordings.isNotEmpty) {
+      // iOS may change the sandbox's absolute path after an app update/restore.
+      final directory = await _recordingsDirectory();
+      recordings = recordings.map((item) => item.copyWith(
+        filePath: '${directory.path}${Platform.pathSeparator}${item.fileName}',
+      )).toList();
+    }
     final settings = await _settingsStore.load();
 
     if (!mounted) {
@@ -203,6 +248,127 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       _selectedLabelId = labels.first.id;
       _loading = false;
     });
+  }
+
+  // ---------------------------------------------------------------------
+  // Notification ghi âm (Android)
+  // ---------------------------------------------------------------------
+
+  /// Đảm bảo app được phép hiện notification.
+  ///
+  /// Android 13+ cần quyền runtime `POST_NOTIFICATIONS`; trên một số máy
+  /// (đặc biệt Xiaomi/MIUI) người dùng còn phải bật thêm trong cài đặt
+  /// thông báo của app. Trả về true nếu notification có thể hiển thị.
+  Future<bool> _ensureNotificationPermission() async {
+    if (!Platform.isAndroid) {
+      return false;
+    }
+    Map<String, dynamic>? result;
+    try {
+      result = (await _recordingControlChannel.invokeMethod<Map<Object?, Object?>>(
+        'requestNotificationPermission',
+      ))?.cast<String, dynamic>();
+    } catch (_) {
+      // Không phải Android (web/iOS/...): coi như không cần notification.
+      return false;
+    }
+    if (result == null) {
+      return false;
+    }
+
+    final enabled = result['enabled'] == true;
+    if (enabled) {
+      return true;
+    }
+
+    // Chưa bật: mở màn cài đặt thông báo để người dùng tự bật.
+    if (mounted) {
+      await _showNotificationBlockedDialog();
+    }
+    try {
+      await _recordingControlChannel.invokeMethod<void>('openNotificationSettings');
+    } catch (_) {
+      // Bỏ qua nếu không mở được cài đặt.
+    }
+    return false;
+  }
+
+  Future<void> _showNotificationBlockedDialog() async {
+    if (!mounted) {
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Cần bật thông báo'),
+          content: const Text(
+            'Để điều khiển ghi âm (Tạm dừng / Dừng) từ thanh thông báo, '
+            'hãy bật "Cho phép thông báo" cho app.\n\n'
+            'Trên Xiaomi/MIUI: Cài đặt > Ứng dụng > Quản lý ứng dụng > '
+            'Record Horus > Thông báo > Bật "Hiển thị thông báo".',
+          ),
+          actions: [TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Đã hiểu'))],
+        );
+      },
+    );
+  }
+
+  Future<void> _showRecordingNotification({required bool paused, required String label}) async {
+    try {
+      if (defaultTargetPlatform == TargetPlatform.iOS) {
+        final enabled = await _recordingControlChannel.invokeMethod<bool>('update', <String, dynamic>{
+          'paused': paused,
+          'label': label,
+          'recordingId': _tempRecordingPath,
+        });
+        if (enabled == false && _elapsed == Duration.zero) {
+          _showSnack('Live Activity chưa khả dụng. Bạn vẫn có thể điều khiển ghi âm trong app.');
+        }
+        return;
+      }
+      if (paused) {
+        await _recordingControlChannel.invokeMethod<void>('setPaused', <String, dynamic>{
+          'paused': true,
+          'label': label,
+        });
+      } else {
+        await _recordingControlChannel.invokeMethod<void>('start', <String, dynamic>{'label': label});
+      }
+    } catch (_) {
+      // Không phải Android: bỏ qua.
+    }
+  }
+
+  Future<void> _dismissRecordingNotification() async {
+    try {
+      await _recordingControlChannel.invokeMethod<void>('stop');
+    } catch (_) {
+      // Không phải Android: bỏ qua.
+    }
+  }
+
+  Future<void> _handleNotificationAction(String action) async {
+    switch (action) {
+      case 'pause':
+        if (_isRecording && !_isPaused) {
+          await _togglePause();
+        }
+        break;
+      case 'resume':
+        if (_isRecording && _isPaused) {
+          await _togglePause();
+        }
+        break;
+      case 'stop':
+        if (_isRecording) {
+          await _stopRecording(backgroundAction: defaultTargetPlatform == TargetPlatform.iOS);
+        }
+        break;
+      case 'cancel':
+        await _cancelRecording();
+        break;
+    }
   }
 
   Future<void> _startRecording() async {
@@ -243,7 +409,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
 
       await _recorder.start(
         const RecordConfig(
-          encoder: encoder,
+          encoder: AudioEncoder.aacLc,
           bitRate: 128000,
           sampleRate: 44100,
           numChannels: 1,
@@ -251,6 +417,16 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
         ),
         path: tempPath,
       );
+
+      // Đảm bảo app được phép hiện notification (Android 13+ cần quyền
+      // POST_NOTIFICATIONS; trên Xiaomi/MIUI có thể phải bật thêm trong
+      // cài đặt thông báo của app) rồi mới hiện notification ghi âm.
+      // Notification này giữ process foreground để mic không bị câm khi
+      // tắt màn hình / chuyển app (lỗi chỉ nghe được ~1 phút đầu).
+      final canShowNotification = await _ensureNotificationPermission();
+      if (canShowNotification) {
+        unawaited(_showRecordingNotification(paused: false, label: label.name));
+      }
 
       _elapsedTimer?.cancel();
       if (!mounted) {
@@ -270,7 +446,11 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
         _busy = false;
       });
       _startAmplitudeMonitoring();
+      _recordingClock..reset()..start();
       _startElapsedTimer();
+      if (defaultTargetPlatform == TargetPlatform.iOS) {
+        await _showRecordingNotification(paused: false, label: label.name);
+      }
       unawaited(HapticFeedback.mediumImpact());
     } catch (error) {
       _showSnack(_friendlyError(error));
@@ -309,17 +489,20 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
     return picked;
   }
 
-  Future<void> _stopRecording() async {
+  Future<void> _stopRecording({bool backgroundAction = false}) async {
     if (_busy || !_isRecording) {
       return;
     }
 
     final label = _selectedLabel;
     final startedAt = _recordingStartedAt ?? DateTime.now();
+    var stopped = false;
     setState(() => _busy = true);
 
     try {
       final stoppedPath = await _recorder.stop();
+      stopped = true;
+      _recordingClock.stop();
       final endedAt = DateTime.now();
       _elapsedTimer?.cancel();
       _stopAmplitudeMonitoring();
@@ -335,11 +518,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       }
 
       final directory = await _recordingsDirectory();
-      final fileName = _buildRecordingFileName(
-        label?.name ?? 'Chung',
-        startedAt,
-        endedAt,
-      );
+      final fileName = _buildRecordingFileName(label?.name ?? 'Chung', startedAt, endedAt);
       final targetFile = await _uniqueFile(directory, fileName);
       final savedFile = await sourceFile.rename(targetFile.path);
 
@@ -369,13 +548,19 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
         _waveTick = 0;
         _isRecording = false;
         _isPaused = false;
-        _busy = false;
       });
+      // Xoá notification ghi âm khi dừng.
+      await _dismissRecordingNotification();
       unawaited(HapticFeedback.selectionClick());
       _showSnack('Đã lưu: ${recording.fileName}');
-      unawaited(_uploadRecording(recording, showSuccess: true));
+      if (defaultTargetPlatform == TargetPlatform.iOS) {
+        // Native giữ background task đến khi lưu/upload hoàn tất hoặc iOS hết thời gian.
+        await _uploadRecording(recording, showSuccess: true, boundedBackgroundUpload: backgroundAction);
+      } else {
+        unawaited(_uploadRecording(recording, showSuccess: true));
+      }
     } catch (error) {
-      if (mounted) {
+      if (mounted && stopped) {
         _stopAmplitudeMonitoring();
         setState(() {
           _recordingStartedAt = null;
@@ -391,6 +576,9 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       }
       _showSnack(_friendlyError(error));
     } finally {
+      if (stopped) {
+        await _dismissRecordingNotification();
+      }
       if (mounted && _busy) {
         setState(() => _busy = false);
       }
@@ -402,18 +590,67 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       return;
     }
 
+    final nextPaused = !_isPaused;
+    setState(() => _busy = true);
     try {
-      if (_isPaused) {
-        await _recorder.resume();
-      } else {
+      if (nextPaused) {
         await _recorder.pause();
+        _recordingClock.stop();
+      } else {
+        await _recorder.resume();
+        _recordingClock.start();
       }
       if (!mounted) {
         return;
       }
-      setState(() => _isPaused = !_isPaused);
+      setState(() => _isPaused = nextPaused);
+      // Đồng bộ trạng thái lên notification (đổi nút Pause/Resume + tạm
+      // ngừng đếm thời gian).
+      await _showRecordingNotification(paused: nextPaused, label: _selectedLabel?.name ?? 'Chung');
     } catch (error) {
       _showSnack(_friendlyError(error));
+    } finally {
+      if (mounted) {
+        setState(() => _busy = false);
+      }
+    }
+  }
+
+  Future<void> _cancelRecording() async {
+    if (_busy || !_isRecording) {
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      final path = await _recorder.stop() ?? _tempRecordingPath;
+      if (path != null) {
+        final file = File(path);
+        if (await file.exists()) {
+          await file.delete();
+        }
+      }
+      _recordingClock.stop();
+      _elapsedTimer?.cancel();
+      _stopAmplitudeMonitoring();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _recordingStartedAt = null;
+        _tempRecordingPath = null;
+        _elapsed = Duration.zero;
+        _isRecording = false;
+        _isPaused = false;
+        _waveSamples = List<double>.filled(56, 0.12);
+      });
+      await _dismissRecordingNotification();
+      _showSnack('Đã hủy bản ghi đang ghi');
+    } catch (error) {
+      _showSnack(_friendlyError(error));
+    } finally {
+      if (mounted) {
+        setState(() => _busy = false);
+      }
     }
   }
 
@@ -525,10 +762,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
 
     setState(() => _linkingIds.add(recording.id));
     try {
-      final link = await _drive.getRecordingLink(
-        settings: _settings,
-        recording: recording,
-      );
+      final link = await _drive.getRecordingLink(settings: _settings, recording: recording);
       final updated = recording.copyWith(shareLink: link);
       await _replaceRecording(updated);
       await _copyText(link, 'Đã copy link âm thanh');
@@ -550,10 +784,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
     _showSnack(message);
   }
 
-  Future<void> _uploadRecording(
-    RecordingItem recording, {
-    bool showSuccess = false,
-  }) async {
+  Future<void> _uploadRecording(RecordingItem recording, {bool showSuccess = false, bool boundedBackgroundUpload = false}) async {
     if (_uploadingIds.contains(recording.id)) {
       return;
     }
@@ -576,11 +807,10 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       setState(() => _uploadingIds.add(recording.id));
     }
 
+    final uploadService = boundedBackgroundUpload ? HorusDriveService() : _drive;
     try {
-      final result = await _drive.uploadRecording(
-        settings: _settings,
-        recording: recording,
-      );
+      final upload = uploadService.uploadRecording(settings: _settings, recording: recording);
+      final result = await (boundedBackgroundUpload ? upload.timeout(const Duration(seconds: 20)) : upload);
       final updated = recording.copyWith(
         uploadedAt: DateTime.now(),
         remotePath: result.remotePath,
@@ -601,6 +831,9 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       await _replaceRecording(updated);
       _showSnack('Chưa tải lên được: ${_friendlyError(error)}');
     } finally {
+      if (boundedBackgroundUpload) {
+        uploadService.close();
+      }
       if (mounted) {
         setState(() => _uploadingIds.remove(recording.id));
       }
@@ -608,9 +841,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
   }
 
   Future<void> _replaceRecording(RecordingItem updated) async {
-    final next = _recordings
-        .map((recording) => recording.id == updated.id ? updated : recording)
-        .toList();
+    final next = _recordings.map((recording) => recording.id == updated.id ? updated : recording).toList();
     await _localStore.saveRecordings(next);
     if (!mounted) {
       return;
@@ -626,10 +857,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
           title: const Text('Xoá bản ghi?'),
           content: Text(recording.fileName),
           actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Huỷ'),
-            ),
+            TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Huỷ')),
             FilledButton(
               style: FilledButton.styleFrom(
                 backgroundColor: Theme.of(context).colorScheme.error,
@@ -656,9 +884,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       await file.delete();
     }
 
-    final next = _recordings
-        .where((item) => item.id != recording.id)
-        .toList(growable: false);
+    final next = _recordings.where((item) => item.id != recording.id).toList(growable: false);
     await _localStore.saveRecordings(next);
     if (!mounted) {
       return;
@@ -690,12 +916,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
 
     final next = label == null
         ? [..._labels, LabelItem(id: _newId(), name: name)]
-        : _labels
-              .map(
-                (item) =>
-                    item.id == label.id ? item.copyWith(name: name) : item,
-              )
-              .toList();
+        : _labels.map((item) => item.id == label.id ? item.copyWith(name: name) : item).toList();
 
     await _localStore.saveLabels(next);
     if (!mounted) {
@@ -724,10 +945,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
           title: const Text('Xoá nhãn?'),
           content: Text(label.name),
           actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Huỷ'),
-            ),
+            TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Huỷ')),
             FilledButton(
               style: FilledButton.styleFrom(
                 backgroundColor: Theme.of(context).colorScheme.error,
@@ -745,9 +963,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       return;
     }
 
-    final next = _labels
-        .where((item) => item.id != label.id)
-        .toList(growable: false);
+    final next = _labels.where((item) => item.id != label.id).toList(growable: false);
     await _localStore.saveLabels(next);
     if (!mounted) {
       return;
@@ -761,8 +977,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
   Future<void> _openSettings() async {
     final result = await showDialog<HorusSettings>(
       context: context,
-      builder: (context) =>
-          _SettingsDialog(settings: _settings, onTest: _testSettings),
+      builder: (context) => _SettingsDialog(settings: _settings, onTest: _testSettings),
     );
 
     if (result == null) {
@@ -794,9 +1009,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
 
   Future<Directory> _recordingsDirectory() async {
     final base = await getApplicationDocumentsDirectory();
-    final directory = Directory(
-      '${base.path}${Platform.pathSeparator}recordings',
-    );
+    final directory = Directory('${base.path}${Platform.pathSeparator}recordings');
     if (!await directory.exists()) {
       await directory.create(recursive: true);
     }
@@ -805,17 +1018,13 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
 
   Future<File> _uniqueFile(Directory directory, String fileName) async {
     final dotIndex = fileName.lastIndexOf('.');
-    final baseName = dotIndex == -1
-        ? fileName
-        : fileName.substring(0, dotIndex);
+    final baseName = dotIndex == -1 ? fileName : fileName.substring(0, dotIndex);
     final extension = dotIndex == -1 ? '' : fileName.substring(dotIndex);
 
     var candidate = File('${directory.path}${Platform.pathSeparator}$fileName');
     var index = 2;
     while (await candidate.exists()) {
-      candidate = File(
-        '${directory.path}${Platform.pathSeparator}$baseName-$index$extension',
-      );
+      candidate = File('${directory.path}${Platform.pathSeparator}$baseName-$index$extension');
       index += 1;
     }
     return candidate;
@@ -827,7 +1036,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       if (!mounted || !_isRecording || _isPaused) {
         return;
       }
-      setState(() => _elapsed += const Duration(seconds: 1));
+      setState(() => _elapsed = _recordingClock.elapsed);
     });
   }
 
@@ -839,14 +1048,12 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
 
   void _startAmplitudeMonitoring() {
     unawaited(_amplitudeSubscription?.cancel());
-    _amplitudeSubscription = _recorder
-        .onAmplitudeChanged(const Duration(milliseconds: 90))
-        .listen((amplitude) {
-          if (!mounted || !_isRecording || _isPaused) {
-            return;
-          }
-          _pushWaveSample(_levelFromAmplitude(amplitude));
-        });
+    _amplitudeSubscription = _recorder.onAmplitudeChanged(const Duration(milliseconds: 90)).listen((amplitude) {
+      if (!mounted || !_isRecording || _isPaused) {
+        return;
+      }
+      _pushWaveSample(_levelFromAmplitude(amplitude));
+    });
   }
 
   void _stopAmplitudeMonitoring() {
@@ -878,10 +1085,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       _peakDb = _noiseFloorDb + 16;
     }
 
-    final normalized = ((db - _noiseFloorDb) / (_peakDb - _noiseFloorDb)).clamp(
-      0.0,
-      1.0,
-    );
+    final normalized = ((db - _noiseFloorDb) / (_peakDb - _noiseFloorDb)).clamp(0.0, 1.0);
     final boosted = math.pow(normalized, 0.46).toDouble();
     final pulse = math.sin(_waveTick * 0.72) * 0.035;
     return (0.12 + boosted * 0.88 + pulse).clamp(0.10, 1.0);
@@ -901,11 +1105,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       ..showSnackBar(SnackBar(content: Text(message)));
   }
 
-  String _buildRecordingFileName(
-    String label,
-    DateTime startedAt,
-    DateTime endedAt,
-  ) {
+  String _buildRecordingFileName(String label, DateTime startedAt, DateTime endedAt) {
     return '${_sanitizeLabel(label)}_${_formatForFile(startedAt)}_${_formatForFile(endedAt)}.m4a';
   }
 
@@ -1004,17 +1204,11 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
     final scheme = Theme.of(context).colorScheme;
     final ready = _settings.hasUploadCredentials;
     final host = Uri.tryParse(_settings.serverUrl)?.host;
-    final account =
-        _settings.authMode == HorusAuthMode.bearer &&
-            _settings.username.trim().isEmpty
+    final account = _settings.authMode == HorusAuthMode.bearer && _settings.username.trim().isEmpty
         ? 'Bearer token'
         : '${_settings.username}@${host ?? _settings.serverUrl}';
-    final background = ready
-        ? const Color(0xFFEAF6EF)
-        : const Color(0xFFFFF6E7);
-    final foreground = ready
-        ? const Color(0xFF0D6B3F)
-        : const Color(0xFF8A4F00);
+    final background = ready ? const Color(0xFFEAF6EF) : const Color(0xFFFFF6E7);
+    final foreground = ready ? const Color(0xFF0D6B3F) : const Color(0xFF8A4F00);
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -1026,10 +1220,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          Icon(
-            ready ? Icons.cloud_done_outlined : Icons.cloud_off_outlined,
-            color: foreground,
-          ),
+          Icon(ready ? Icons.cloud_done_outlined : Icons.cloud_off_outlined, color: foreground),
           const SizedBox(width: 12),
           Expanded(
             child: Column(
@@ -1037,28 +1228,21 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
               children: [
                 Text(
                   ready ? 'HorusDrive sẵn sàng' : 'Chưa cấu hình HorusDrive',
-                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                    color: foreground,
-                    fontWeight: FontWeight.w700,
-                  ),
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleSmall?.copyWith(color: foreground, fontWeight: FontWeight.w700),
                 ),
                 const SizedBox(height: 4),
                 Text(
                   ready ? '$account / ${_settings.remoteFolder}' : account,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: scheme.onSurfaceVariant,
-                  ),
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
                 ),
               ],
             ),
           ),
-          TextButton.icon(
-            onPressed: _openSettings,
-            icon: const Icon(Icons.tune_outlined),
-            label: const Text('Sửa'),
-          ),
+          TextButton.icon(onPressed: _openSettings, icon: const Icon(Icons.tune_outlined), label: const Text('Sửa')),
         ],
       ),
     );
@@ -1088,15 +1272,11 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
                 Expanded(
                   child: Text(
                     'Ghi âm',
-                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
+                    style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
                   ),
                 ),
                 _StatusPill(
-                  icon: _isRecording
-                      ? Icons.fiber_manual_record
-                      : Icons.check_circle_outline,
+                  icon: _isRecording ? Icons.fiber_manual_record : Icons.check_circle_outline,
                   text: statusText,
                   color: statusColor,
                 ),
@@ -1123,18 +1303,14 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
               textAlign: TextAlign.center,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: Theme.of(
-                context,
-              ).textTheme.bodyLarge?.copyWith(color: scheme.onSurfaceVariant),
+              style: Theme.of(context).textTheme.bodyLarge?.copyWith(color: scheme.onSurfaceVariant),
             ),
             const SizedBox(height: 24),
             FilledButton.icon(
               style: FilledButton.styleFrom(
                 minimumSize: const Size.fromHeight(56),
                 backgroundColor: _isRecording ? scheme.error : scheme.primary,
-                foregroundColor: _isRecording
-                    ? scheme.onError
-                    : scheme.onPrimary,
+                foregroundColor: _isRecording ? scheme.onError : scheme.onPrimary,
               ),
               onPressed: _busy
                   ? null
@@ -1147,9 +1323,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
             if (_isRecording) ...[
               const SizedBox(height: 12),
               OutlinedButton.icon(
-                style: OutlinedButton.styleFrom(
-                  minimumSize: const Size.fromHeight(48),
-                ),
+                style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(48)),
                 onPressed: _busy ? null : _togglePause,
                 icon: Icon(_isPaused ? Icons.play_arrow : Icons.pause),
                 label: Text(_isPaused ? 'Tiếp tục' : 'Tạm dừng'),
@@ -1179,9 +1353,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
                 Expanded(
                   child: Text(
                     'Nhãn',
-                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
+                    style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
                   ),
                 ),
                 IconButton.filledTonal(
@@ -1235,20 +1407,12 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Text(
-          'Bản ghi',
-          style: Theme.of(
-            context,
-          ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
-        ),
+        Text('Bản ghi', style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700)),
         const SizedBox(height: 12),
         if (_recordings.isEmpty)
           _buildEmptyRecordings(context)
         else
-          for (final recording in _recordings) ...[
-            _buildRecordingCard(context, recording),
-            const SizedBox(height: 12),
-          ],
+          for (final recording in _recordings) ...[_buildRecordingCard(context, recording), const SizedBox(height: 12)],
       ],
     );
   }
@@ -1264,17 +1428,11 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       ),
       child: Column(
         children: [
-          Icon(
-            Icons.mic_none_outlined,
-            size: 40,
-            color: scheme.onSurfaceVariant,
-          ),
+          Icon(Icons.mic_none_outlined, size: 40, color: scheme.onSurfaceVariant),
           const SizedBox(height: 12),
           Text(
             'Chưa có bản ghi',
-            style: Theme.of(
-              context,
-            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+            style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
           ),
         ],
       ),
@@ -1287,16 +1445,10 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
     final linking = _linkingIds.contains(recording.id);
     final playbackLoaded = _loadedPlaybackId == recording.id;
     final playbackPlaying = _playingRecordingId == recording.id;
-    final duration = playbackLoaded && _playbackDuration > Duration.zero
-        ? _playbackDuration
-        : recording.duration;
+    final duration = playbackLoaded && _playbackDuration > Duration.zero ? _playbackDuration : recording.duration;
     final position = playbackLoaded ? _playbackPosition : Duration.zero;
-    final positionMs = position.inMilliseconds
-        .clamp(0, duration.inMilliseconds)
-        .toDouble();
-    final durationMs = duration.inMilliseconds <= 0
-        ? 1.0
-        : duration.inMilliseconds.toDouble();
+    final positionMs = position.inMilliseconds.clamp(0, duration.inMilliseconds).toDouble();
+    final durationMs = duration.inMilliseconds <= 0 ? 1.0 : duration.inMilliseconds.toDouble();
     final statusColor = uploading
         ? scheme.primary
         : recording.isUploaded
@@ -1330,17 +1482,11 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
                     recording.fileName,
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
                   ),
                 ),
                 const SizedBox(width: 8),
-                _StatusPill(
-                  icon: statusIcon,
-                  text: statusText,
-                  color: statusColor,
-                ),
+                _StatusPill(icon: statusIcon, text: statusText, color: statusColor),
               ],
             ),
             const SizedBox(height: 8),
@@ -1348,9 +1494,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
               '${recording.label} • ${_formatDateTime(recording.startedAt)} - ${_formatTime(recording.endedAt)} • ${_formatDuration(recording.duration)}',
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
-              style: Theme.of(
-                context,
-              ).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
             ),
             if (recording.uploadError != null) ...[
               const SizedBox(height: 8),
@@ -1358,9 +1502,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
                 recording.uploadError!,
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
-                style: Theme.of(
-                  context,
-                ).textTheme.bodySmall?.copyWith(color: scheme.error),
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: scheme.error),
               ),
             ],
             const SizedBox(height: 12),
@@ -1368,9 +1510,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
               children: [
                 IconButton.filledTonal(
                   tooltip: playbackPlaying ? 'Tạm dừng nghe' : 'Nghe lại',
-                  onPressed: _playbackBusy
-                      ? null
-                      : () => _togglePlayback(recording),
+                  onPressed: _playbackBusy ? null : () => _togglePlayback(recording),
                   icon: Icon(playbackPlaying ? Icons.pause : Icons.play_arrow),
                 ),
                 const SizedBox(width: 8),
@@ -1382,9 +1522,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
                             SliderTheme(
                               data: SliderTheme.of(context).copyWith(
                                 trackHeight: 3,
-                                thumbShape: const RoundSliderThumbShape(
-                                  enabledThumbRadius: 6,
-                                ),
+                                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
                               ),
                               child: Slider(
                                 min: 0,
@@ -1392,30 +1530,24 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
                                 value: positionMs,
                                 onChanged: (value) {
                                   setState(() {
-                                    _playbackPosition = Duration(
-                                      milliseconds: value.round(),
-                                    );
+                                    _playbackPosition = Duration(milliseconds: value.round());
                                   });
                                 },
                                 onChangeEnd: _seekPlayback,
                               ),
                             ),
                             Padding(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 4,
-                              ),
+                              padding: const EdgeInsets.symmetric(horizontal: 4),
                               child: Text(
                                 '${_formatDuration(position)} / ${_formatDuration(duration)}',
-                                style: Theme.of(context).textTheme.bodySmall
-                                    ?.copyWith(color: scheme.onSurfaceVariant),
+                                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
                               ),
                             ),
                           ],
                         )
                       : Text(
                           'Nghe lại',
-                          style: Theme.of(context).textTheme.bodyMedium
-                              ?.copyWith(color: scheme.onSurfaceVariant),
+                          style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
                         ),
                 ),
               ],
@@ -1427,31 +1559,20 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
                 if (!recording.isUploaded)
                   IconButton(
                     tooltip: 'Tải lên HorusDrive',
-                    onPressed: uploading
-                        ? null
-                        : () => _uploadRecording(recording, showSuccess: true),
+                    onPressed: uploading ? null : () => _uploadRecording(recording, showSuccess: true),
                     icon: const Icon(Icons.cloud_upload_outlined),
                   ),
-                if (recording.isUploaded ||
-                    recording.shareLink != null ||
-                    recording.remotePath != null)
+                if (recording.isUploaded || recording.shareLink != null || recording.remotePath != null)
                   IconButton(
                     tooltip: 'Copy link âm thanh',
-                    onPressed: linking
-                        ? null
-                        : () => _copyRecordingLink(recording),
+                    onPressed: linking ? null : () => _copyRecordingLink(recording),
                     icon: linking
-                        ? const SizedBox.square(
-                            dimension: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
+                        ? const SizedBox.square(dimension: 20, child: CircularProgressIndicator(strokeWidth: 2))
                         : const Icon(Icons.link_outlined),
                   ),
                 IconButton(
                   tooltip: 'Xoá bản ghi local',
-                  onPressed: uploading
-                      ? null
-                      : () => _deleteRecording(recording),
+                  onPressed: uploading ? null : () => _deleteRecording(recording),
                   icon: const Icon(Icons.delete_outline),
                 ),
               ],
@@ -1464,11 +1585,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
 }
 
 class _LiveWaveform extends StatelessWidget {
-  const _LiveWaveform({
-    required this.samples,
-    required this.active,
-    required this.color,
-  });
+  const _LiveWaveform({required this.samples, required this.active, required this.color});
 
   final List<double> samples;
   final bool active;
@@ -1482,22 +1599,15 @@ class _LiveWaveform extends StatelessWidget {
       child: Container(
         height: 72,
         decoration: BoxDecoration(
-          color: active
-              ? color.withValues(alpha: 0.10)
-              : scheme.surfaceContainerHighest.withValues(alpha: 0.45),
+          color: active ? color.withValues(alpha: 0.10) : scheme.surfaceContainerHighest.withValues(alpha: 0.45),
           borderRadius: BorderRadius.circular(8),
           border: Border.all(
-            color: active
-                ? color.withValues(alpha: 0.16)
-                : scheme.outlineVariant.withValues(alpha: 0.6),
+            color: active ? color.withValues(alpha: 0.16) : scheme.outlineVariant.withValues(alpha: 0.6),
           ),
         ),
         child: RepaintBoundary(
           child: CustomPaint(
-            painter: _WaveformPainter(
-              samples: samples,
-              color: active ? color : scheme.onSurfaceVariant,
-            ),
+            painter: _WaveformPainter(samples: samples, color: active ? color : scheme.onSurfaceVariant),
             child: const SizedBox.expand(),
           ),
         ),
@@ -1523,16 +1633,10 @@ class _WaveformPainter extends CustomPainter {
       ..color = color.withValues(alpha: 0.16)
       ..strokeWidth = 1.2
       ..strokeCap = StrokeCap.round;
-    canvas.drawLine(
-      Offset(12, centerY),
-      Offset(size.width - 12, centerY),
-      linePaint,
-    );
+    canvas.drawLine(Offset(12, centerY), Offset(size.width - 12, centerY), linePaint);
 
     final barWidth = (size.width / (samples.length * 2.35)).clamp(2.5, 4.2);
-    final gap =
-        ((size.width - 24 - samples.length * barWidth) / (samples.length - 1))
-            .clamp(1.8, 5.0);
+    final gap = ((size.width - 24 - samples.length * barWidth) / (samples.length - 1)).clamp(1.8, 5.0);
     final totalWidth = samples.length * barWidth + (samples.length - 1) * gap;
     var x = (size.width - totalWidth) / 2;
     final maxBarHeight = size.height - 18;
@@ -1543,10 +1647,7 @@ class _WaveformPainter extends CustomPainter {
       final age = (index + 1) / samples.length;
       final envelope = 0.72 + 0.28 * math.sin(age * math.pi);
       final flutter = 1 + 0.1 * math.sin(index * 1.73 + sample * 6.0);
-      final shaped = (math.pow(sample, 0.72) * envelope * flutter).clamp(
-        0.08,
-        1.0,
-      );
+      final shaped = (math.pow(sample, 0.72) * envelope * flutter).clamp(0.08, 1.0);
       final height = 8 + (maxBarHeight - 8) * shaped;
       final rect = RRect.fromRectAndRadius(
         Rect.fromLTWH(x, centerY - height / 2, barWidth, height),
@@ -1573,11 +1674,7 @@ class _WaveformPainter extends CustomPainter {
 }
 
 class _StatusPill extends StatelessWidget {
-  const _StatusPill({
-    required this.icon,
-    required this.text,
-    required this.color,
-  });
+  const _StatusPill({required this.icon, required this.text, required this.color});
 
   final IconData icon;
   final String text;
@@ -1588,10 +1685,7 @@ class _StatusPill extends StatelessWidget {
     return Container(
       constraints: const BoxConstraints(minHeight: 32),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.1),
-        borderRadius: BorderRadius.circular(16),
-      ),
+      decoration: BoxDecoration(color: color.withValues(alpha: 0.1), borderRadius: BorderRadius.circular(16)),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -1599,10 +1693,7 @@ class _StatusPill extends StatelessWidget {
           const SizedBox(width: 6),
           Text(
             text,
-            style: Theme.of(context).textTheme.labelMedium?.copyWith(
-              color: color,
-              fontWeight: FontWeight.w700,
-            ),
+            style: Theme.of(context).textTheme.labelMedium?.copyWith(color: color, fontWeight: FontWeight.w700),
           ),
         ],
       ),
@@ -1611,23 +1702,17 @@ class _StatusPill extends StatelessWidget {
 }
 
 class _SelectRecordingLabelDialog extends StatefulWidget {
-  const _SelectRecordingLabelDialog({
-    required this.labels,
-    required this.initialLabelId,
-    required this.newLabelId,
-  });
+  const _SelectRecordingLabelDialog({required this.labels, required this.initialLabelId, required this.newLabelId});
 
   final List<LabelItem> labels;
   final String? initialLabelId;
   final String Function() newLabelId;
 
   @override
-  State<_SelectRecordingLabelDialog> createState() =>
-      _SelectRecordingLabelDialogState();
+  State<_SelectRecordingLabelDialog> createState() => _SelectRecordingLabelDialogState();
 }
 
-class _SelectRecordingLabelDialogState
-    extends State<_SelectRecordingLabelDialog> {
+class _SelectRecordingLabelDialogState extends State<_SelectRecordingLabelDialog> {
   late final TextEditingController _newLabelController;
   late List<LabelItem> _labels;
   String? _selectedLabelId;
@@ -1638,9 +1723,7 @@ class _SelectRecordingLabelDialogState
     super.initState();
     _newLabelController = TextEditingController();
     _labels = [...widget.labels];
-    final initialExists = _labels.any(
-      (label) => label.id == widget.initialLabelId,
-    );
+    final initialExists = _labels.any((label) => label.id == widget.initialLabelId);
     _selectedLabelId = initialExists
         ? widget.initialLabelId!
         : _labels.isEmpty
@@ -1662,9 +1745,7 @@ class _SelectRecordingLabelDialogState
     }
 
     final normalized = name.toLowerCase();
-    final duplicated = _labels.any(
-      (label) => label.name.trim().toLowerCase() == normalized,
-    );
+    final duplicated = _labels.any((label) => label.name.trim().toLowerCase() == normalized);
     if (duplicated) {
       setState(() => _newLabelError = 'Nhãn đã tồn tại');
       return;
@@ -1684,10 +1765,7 @@ class _SelectRecordingLabelDialogState
     if (selectedLabelId == null || _labels.isEmpty) {
       return null;
     }
-    return _labels.firstWhere(
-      (label) => label.id == selectedLabelId,
-      orElse: () => _labels.first,
-    );
+    return _labels.firstWhere((label) => label.id == selectedLabelId, orElse: () => _labels.first);
   }
 
   @override
@@ -1701,16 +1779,14 @@ class _SelectRecordingLabelDialogState
           mainAxisSize: MainAxisSize.min,
           children: [
             SizedBox(
-              height: _labels.isEmpty
-                  ? 56
-                  : math.min(_labels.length * 56.0, 280.0),
+              height: _labels.isEmpty ? 56 : math.min(_labels.length * 56.0, 280.0),
               child: _labels.isEmpty
                   ? Center(
                       child: Text(
                         'Chưa có nhãn',
-                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                        ),
+                        style: Theme.of(
+                          context,
+                        ).textTheme.bodyMedium?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
                       ),
                     )
                   : RadioGroup<String>(
@@ -1723,11 +1799,7 @@ class _SelectRecordingLabelDialogState
                       },
                       child: ListView(
                         children: [
-                          for (final label in _labels)
-                            RadioListTile<String>(
-                              value: label.id,
-                              title: Text(label.name),
-                            ),
+                          for (final label in _labels) RadioListTile<String>(value: label.id, title: Text(label.name)),
                         ],
                       ),
                     ),
@@ -1741,10 +1813,7 @@ class _SelectRecordingLabelDialogState
                   Expanded(
                     child: TextField(
                       controller: _newLabelController,
-                      decoration: InputDecoration(
-                        labelText: 'Nhãn mới',
-                        errorText: _newLabelError,
-                      ),
+                      decoration: InputDecoration(labelText: 'Nhãn mới', errorText: _newLabelError),
                       textInputAction: TextInputAction.done,
                       onChanged: (_) {
                         if (_newLabelError != null) {
@@ -1755,11 +1824,7 @@ class _SelectRecordingLabelDialogState
                     ),
                   ),
                   const SizedBox(width: 8),
-                  IconButton.filledTonal(
-                    tooltip: 'Thêm nhãn',
-                    onPressed: _addLabel,
-                    icon: const Icon(Icons.add),
-                  ),
+                  IconButton.filledTonal(tooltip: 'Thêm nhãn', onPressed: _addLabel, icon: const Icon(Icons.add)),
                 ],
               ),
             ),
@@ -1767,14 +1832,9 @@ class _SelectRecordingLabelDialogState
         ),
       ),
       actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Hủy'),
-        ),
+        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Hủy')),
         FilledButton.icon(
-          onPressed: _selectedLabel == null
-              ? null
-              : () => Navigator.of(context).pop(_selectedLabel),
+          onPressed: _selectedLabel == null ? null : () => Navigator.of(context).pop(_selectedLabel),
           icon: const Icon(Icons.mic),
           label: const Text('OK'),
         ),
@@ -1784,11 +1844,7 @@ class _SelectRecordingLabelDialogState
 }
 
 class _LabelDialog extends StatefulWidget {
-  const _LabelDialog({
-    required this.title,
-    required this.initialName,
-    required this.existingNames,
-  });
+  const _LabelDialog({required this.title, required this.initialName, required this.existingNames});
 
   final String title;
   final String initialName;
@@ -1839,10 +1895,7 @@ class _LabelDialogState extends State<_LabelDialog> {
         ),
       ),
       actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Hủy'),
-        ),
+        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Hủy')),
         FilledButton(onPressed: _submit, child: const Text('Lưu')),
       ],
     );
@@ -1884,9 +1937,7 @@ class _SettingsDialogState extends State<_SettingsDialog> {
     _serverController = TextEditingController(text: widget.settings.serverUrl);
     _usernameController = TextEditingController(text: widget.settings.username);
     _passwordController = TextEditingController(text: widget.settings.password);
-    _folderController = TextEditingController(
-      text: widget.settings.remoteFolder,
-    );
+    _folderController = TextEditingController(text: widget.settings.remoteFolder);
     _authMode = widget.settings.authMode;
   }
 
@@ -1919,9 +1970,7 @@ class _SettingsDialogState extends State<_SettingsDialog> {
                   if (text.isEmpty) {
                     return 'Nhập server URL';
                   }
-                  final normalized = text.startsWith('http')
-                      ? text
-                      : 'https://$text';
+                  final normalized = text.startsWith('http') ? text : 'https://$text';
                   final uri = Uri.tryParse(normalized);
                   if (uri == null || !uri.hasAuthority) {
                     return 'URL chưa đúng';
@@ -1934,16 +1983,8 @@ class _SettingsDialogState extends State<_SettingsDialog> {
                 alignment: Alignment.centerLeft,
                 child: SegmentedButton<HorusAuthMode>(
                   segments: const [
-                    ButtonSegment(
-                      value: HorusAuthMode.basic,
-                      label: Text('Basic'),
-                      icon: Icon(Icons.key_outlined),
-                    ),
-                    ButtonSegment(
-                      value: HorusAuthMode.bearer,
-                      label: Text('Bearer'),
-                      icon: Icon(Icons.token_outlined),
-                    ),
+                    ButtonSegment(value: HorusAuthMode.basic, label: Text('Basic'), icon: Icon(Icons.key_outlined)),
+                    ButtonSegment(value: HorusAuthMode.bearer, label: Text('Bearer'), icon: Icon(Icons.token_outlined)),
                   ],
                   selected: {_authMode},
                   onSelectionChanged: (selected) {
@@ -1960,13 +2001,10 @@ class _SettingsDialogState extends State<_SettingsDialog> {
                 controller: _usernameController,
                 textInputAction: TextInputAction.next,
                 decoration: InputDecoration(
-                  labelText: _authMode == HorusAuthMode.basic
-                      ? 'Username'
-                      : 'Username / user id',
+                  labelText: _authMode == HorusAuthMode.basic ? 'Username' : 'Username / user id',
                 ),
                 validator: (value) {
-                  if (_authMode == HorusAuthMode.basic &&
-                      (value?.trim() ?? '').isEmpty) {
+                  if (_authMode == HorusAuthMode.basic && (value?.trim() ?? '').isEmpty) {
                     return 'Nhập username';
                   }
                   return null;
@@ -1978,26 +2016,18 @@ class _SettingsDialogState extends State<_SettingsDialog> {
                 obscureText: _obscurePassword,
                 textInputAction: TextInputAction.next,
                 decoration: InputDecoration(
-                  labelText: _authMode == HorusAuthMode.basic
-                      ? 'Password / app password'
-                      : 'Bearer token',
+                  labelText: _authMode == HorusAuthMode.basic ? 'Password / app password' : 'Bearer token',
                   suffixIcon: IconButton(
                     tooltip: _obscurePassword ? 'Hiện password' : 'Ẩn password',
                     onPressed: () {
                       setState(() => _obscurePassword = !_obscurePassword);
                     },
-                    icon: Icon(
-                      _obscurePassword
-                          ? Icons.visibility_outlined
-                          : Icons.visibility_off_outlined,
-                    ),
+                    icon: Icon(_obscurePassword ? Icons.visibility_outlined : Icons.visibility_off_outlined),
                   ),
                 ),
                 validator: (value) {
                   if ((value?.trim() ?? '').isEmpty) {
-                    return _authMode == HorusAuthMode.basic
-                        ? 'Nhập password'
-                        : 'Nhập Bearer token';
+                    return _authMode == HorusAuthMode.basic ? 'Nhập password' : 'Nhập Bearer token';
                   }
                   return null;
                 },
@@ -2015,21 +2045,15 @@ class _SettingsDialogState extends State<_SettingsDialog> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Icon(
-                      _testSucceeded == true
-                          ? Icons.check_circle_outline
-                          : Icons.error_outline,
-                      color: _testSucceeded == true
-                          ? const Color(0xFF0D6B3F)
-                          : Theme.of(context).colorScheme.error,
+                      _testSucceeded == true ? Icons.check_circle_outline : Icons.error_outline,
+                      color: _testSucceeded == true ? const Color(0xFF0D6B3F) : Theme.of(context).colorScheme.error,
                     ),
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
                         _testMessage!,
                         style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: _testSucceeded == true
-                              ? const Color(0xFF0D6B3F)
-                              : Theme.of(context).colorScheme.error,
+                          color: _testSucceeded == true ? const Color(0xFF0D6B3F) : Theme.of(context).colorScheme.error,
                         ),
                       ),
                     ),
@@ -2041,17 +2065,11 @@ class _SettingsDialogState extends State<_SettingsDialog> {
         ),
       ),
       actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Huỷ'),
-        ),
+        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Huỷ')),
         TextButton.icon(
           onPressed: _testing ? null : _testConnection,
           icon: _testing
-              ? const SizedBox.square(
-                  dimension: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
+              ? const SizedBox.square(dimension: 18, child: CircularProgressIndicator(strokeWidth: 2))
               : const Icon(Icons.wifi_tethering_outlined),
           label: const Text('Kiểm tra'),
         ),
