@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
+import 'package:share_plus/share_plus.dart';
 
 import 'app_models.dart';
 import 'horus_drive_service.dart';
@@ -98,6 +99,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
   String? _playingRecordingId;
   final Set<String> _uploadingIds = {};
   final Set<String> _linkingIds = {};
+  final Set<String> _sharingIds = {};
 
   // Notification Android / Live Activity iOS.
   static const _recordingControlChannel = MethodChannel('com.example.record_horus/recording_control');
@@ -362,7 +364,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
         break;
       case 'stop':
         if (_isRecording) {
-          await _stopRecording(backgroundAction: defaultTargetPlatform == TargetPlatform.iOS);
+          await _stopRecording();
         }
         break;
       case 'cancel':
@@ -489,7 +491,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
     return picked;
   }
 
-  Future<void> _stopRecording({bool backgroundAction = false}) async {
+  Future<void> _stopRecording() async {
     if (_busy || !_isRecording) {
       return;
     }
@@ -553,12 +555,6 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       await _dismissRecordingNotification();
       unawaited(HapticFeedback.selectionClick());
       _showSnack('Đã lưu: ${recording.fileName}');
-      if (defaultTargetPlatform == TargetPlatform.iOS) {
-        // Native giữ background task đến khi lưu/upload hoàn tất hoặc iOS hết thời gian.
-        await _uploadRecording(recording, showSuccess: true, boundedBackgroundUpload: backgroundAction);
-      } else {
-        unawaited(_uploadRecording(recording, showSuccess: true));
-      }
     } catch (error) {
       if (mounted && stopped) {
         _stopAmplitudeMonitoring();
@@ -740,6 +736,38 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
     });
   }
 
+  Future<void> _shareRecording(RecordingItem recording, BuildContext buttonContext) async {
+    if (_sharingIds.contains(recording.id)) {
+      return;
+    }
+
+    final box = buttonContext.findRenderObject() as RenderBox?;
+    final origin = box == null ? null : box.localToGlobal(Offset.zero) & box.size;
+    setState(() => _sharingIds.add(recording.id));
+    try {
+      if (!await File(recording.filePath).exists()) {
+        _showSnack('Không tìm thấy file ghi âm trên máy');
+        return;
+      }
+      if (!mounted) {
+        return;
+      }
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(recording.filePath, mimeType: 'audio/mp4')],
+          subject: recording.fileName,
+          sharePositionOrigin: origin,
+        ),
+      );
+    } catch (error) {
+      _showSnack('Không thể chia sẻ bản ghi: ${_friendlyError(error)}');
+    } finally {
+      if (mounted) {
+        setState(() => _sharingIds.remove(recording.id));
+      }
+    }
+  }
+
   Future<void> _copyRecordingLink(RecordingItem recording) async {
     if (_linkingIds.contains(recording.id)) {
       return;
@@ -784,7 +812,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
     _showSnack(message);
   }
 
-  Future<void> _uploadRecording(RecordingItem recording, {bool showSuccess = false, bool boundedBackgroundUpload = false}) async {
+  Future<void> _uploadRecording(RecordingItem recording, {bool showSuccess = false}) async {
     if (_uploadingIds.contains(recording.id)) {
       return;
     }
@@ -807,10 +835,8 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       setState(() => _uploadingIds.add(recording.id));
     }
 
-    final uploadService = boundedBackgroundUpload ? HorusDriveService() : _drive;
     try {
-      final upload = uploadService.uploadRecording(settings: _settings, recording: recording);
-      final result = await (boundedBackgroundUpload ? upload.timeout(const Duration(seconds: 20)) : upload);
+      final result = await _drive.uploadRecording(settings: _settings, recording: recording);
       final updated = recording.copyWith(
         uploadedAt: DateTime.now(),
         remotePath: result.remotePath,
@@ -831,9 +857,6 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
       await _replaceRecording(updated);
       _showSnack('Chưa tải lên được: ${_friendlyError(error)}');
     } finally {
-      if (boundedBackgroundUpload) {
-        uploadService.close();
-      }
       if (mounted) {
         setState(() => _uploadingIds.remove(recording.id));
       }
@@ -990,12 +1013,6 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
     }
     setState(() => _settings = result);
     _showSnack('Đã lưu cấu hình HorusDrive');
-
-    if (result.hasUploadCredentials) {
-      for (final recording in _recordings.where((item) => !item.isUploaded)) {
-        unawaited(_uploadRecording(recording));
-      }
-    }
   }
 
   Future<String?> _testSettings(HorusSettings settings) async {
@@ -1234,7 +1251,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  ready ? '$account / ${_settings.remoteFolder}' : account,
+                  ready ? '$account / ${_settings.remoteFolder}' : 'Có thể ghi âm và chia sẻ file mà không cần cấu hình',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
@@ -1443,6 +1460,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
     final scheme = Theme.of(context).colorScheme;
     final uploading = _uploadingIds.contains(recording.id);
     final linking = _linkingIds.contains(recording.id);
+    final sharing = _sharingIds.contains(recording.id);
     final playbackLoaded = _loadedPlaybackId == recording.id;
     final playbackPlaying = _playingRecordingId == recording.id;
     final duration = playbackLoaded && _playbackDuration > Duration.zero ? _playbackDuration : recording.duration;
@@ -1453,17 +1471,23 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
         ? scheme.primary
         : recording.isUploaded
         ? const Color(0xFF0D6B3F)
-        : scheme.error;
+        : recording.uploadError != null
+        ? scheme.error
+        : scheme.onSurfaceVariant;
     final statusIcon = uploading
         ? Icons.sync
         : recording.isUploaded
         ? Icons.cloud_done_outlined
-        : Icons.cloud_upload_outlined;
+        : recording.uploadError != null
+        ? Icons.cloud_upload_outlined
+        : Icons.phone_android_outlined;
     final statusText = uploading
         ? 'Đang tải'
         : recording.isUploaded
         ? 'Đã tải'
-        : 'Chờ tải';
+        : recording.uploadError != null
+        ? 'Lỗi tải lên'
+        : 'Đã lưu trên máy';
 
     return Card(
       elevation: 0,
@@ -1556,6 +1580,13 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
             Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
+                Builder(
+                  builder: (buttonContext) => IconButton(
+                    tooltip: 'Chia sẻ bản ghi âm',
+                    onPressed: sharing ? null : () => _shareRecording(recording, buttonContext),
+                    icon: const Icon(Icons.share_outlined),
+                  ),
+                ),
                 if (!recording.isUploaded)
                   IconButton(
                     tooltip: 'Tải lên HorusDrive',
@@ -1572,7 +1603,7 @@ class _RecorderHomePageState extends State<RecorderHomePage> {
                   ),
                 IconButton(
                   tooltip: 'Xoá bản ghi local',
-                  onPressed: uploading ? null : () => _deleteRecording(recording),
+                  onPressed: uploading || sharing ? null : () => _deleteRecording(recording),
                   icon: const Icon(Icons.delete_outline),
                 ),
               ],

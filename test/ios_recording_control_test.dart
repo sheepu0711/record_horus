@@ -13,6 +13,7 @@ void main() {
   const record = MethodChannel('com.llfbandit.record/messages');
   const paths = MethodChannel('plugins.flutter.io/path_provider');
   const secure = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
+  const share = MethodChannel('dev.fluttercommunity.plus/share');
   const codec = StandardMethodCodec();
   TestWidgetsFlutterBinding.ensureInitialized();
   final messenger =
@@ -20,6 +21,7 @@ void main() {
   late Directory directory;
   late List<MethodCall> controls;
   late List<String> recorderCalls;
+  late List<MethodCall> shareCalls;
   String? currentPath;
   String? eventsChannel;
   bool failPause = false;
@@ -29,6 +31,7 @@ void main() {
     directory = await Directory.systemTemp.createTemp('horus_ios_test_');
     controls = [];
     recorderCalls = [];
+    shareCalls = [];
     currentPath = null;
     eventsChannel = null;
     failPause = false;
@@ -36,6 +39,10 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     messenger.setMockMethodCallHandler(paths, (_) async => directory.path);
     messenger.setMockMethodCallHandler(secure, (_) async => null);
+    messenger.setMockMethodCallHandler(share, (call) async {
+      shareCalls.add(call);
+      return 'dev.fluttercommunity.plus/share/dismissed';
+    });
     messenger.setMockMethodCallHandler(control, (call) async {
       controls.add(call);
       return call.method == 'update' ? true : null;
@@ -83,6 +90,7 @@ void main() {
       record,
       paths,
       secure,
+      share,
       if (eventsChannel != null) MethodChannel(eventsChannel!),
     ]) {
       messenger.setMockMethodCallHandler(channel, null);
@@ -138,7 +146,7 @@ void main() {
   }
 
   testWidgets(
-    'Live Activity pauses, resumes and saves a recording locally',
+    'Live Activity saves locally and the file can be shared without HorusDrive',
     (tester) async {
       await start(tester);
       expect(
@@ -154,6 +162,8 @@ void main() {
       final recordings =
           jsonDecode(prefs.getString('record_horus.recordings.v1')!) as List;
       expect(recordings, hasLength(1));
+      expect(recordings.single['uploadError'], isNull);
+      expect(recordings.single['uploadedAt'], isNull);
       expect(
         await tester.runAsync(
           () => File(recordings.single['filePath'] as String).exists(),
@@ -162,6 +172,41 @@ void main() {
       );
       expect(await tester.runAsync(() => File(currentPath!).exists()), isFalse);
       expect(controls.last.method, 'stop');
+      await tester.drag(find.byType(CustomScrollView), const Offset(0, -600));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(
+        find.widgetWithIcon(IconButton, Icons.share_outlined),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Đã lưu trên máy'), findsOneWidget);
+      await tester.tap(find.byTooltip('Chia sẻ bản ghi âm'));
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 50)),
+      );
+      await tester.pumpAndSettle();
+      expect(shareCalls, hasLength(1));
+      expect(shareCalls.single.method, 'share');
+      final shared = shareCalls.single.arguments as Map;
+      expect(shared['paths'], [recordings.single['filePath']]);
+      expect(shared['mimeTypes'], ['audio/mp4']);
+      expect(shared['subject'], recordings.single['fileName']);
+      expect(shared['originWidth'], greaterThan(0));
+      expect(shared['originHeight'], greaterThan(0));
+      expect(
+        prefs.getString('record_horus.recordings.v1'),
+        jsonEncode(recordings),
+      );
+
+      await tester.runAsync(
+        () => File(recordings.single['filePath'] as String).delete(),
+      );
+      await tester.tap(find.byTooltip('Chia sẻ bản ghi âm'));
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 50)),
+      );
+      await tester.pumpAndSettle();
+      expect(shareCalls, hasLength(1));
+      expect(find.text('Không tìm thấy file ghi âm trên máy'), findsOneWidget);
       await tester.pumpWidget(const SizedBox.shrink());
       for (var i = 0; i < 10; i++) {
         await tester.pump();

@@ -14,7 +14,9 @@ nhan_yyyymmdd_hhmmss_yyyymmdd_hhmmss.m4a
 
 - Lưu danh sách bản ghi local bằng `SharedPreferences`.
 - Lưu password HorusDrive bằng `flutter_secure_storage`.
-- Tự upload sau khi dừng ghi âm; bản ghi lỗi có thể bấm upload lại.
+- Sau khi dừng ghi âm, bản ghi được lưu trên máy, không tự upload.
+- Chia sẻ trực tiếp file `.m4a` qua menu chia sẻ của điện thoại, không cần tài khoản HorusDrive.
+- Tải lên HorusDrive khi bấm nút upload; bản ghi lỗi có thể bấm upload lại.
 - Tạo/lấy link chia sẻ cho từng file âm thanh và copy link ngay trong app.
 - Nghe lại bản ghi ngay trong app.
 - Hiển thị sóng âm live khi đang ghi.
@@ -81,16 +83,15 @@ Không cần thêm App Group hoặc push server cho Live Activity local.
   **Tạm dừng / Tiếp tục**, **Dừng / Lưu**, **Hủy bản ghi**.
 - iOS 16.2–16.x: các nút trên Live Activity mở app để thực hiện lệnh, có thể cần
   mở khóa thiết bị. iOS 15–16.1: điều khiển trong app.
-- **Dừng / Lưu** lưu file và danh sách local trước khi thử upload HorusDrive.
+- **Dừng / Lưu** chỉ lưu file và danh sách local; có thể chia sẻ hoặc upload khi mở app.
   **Hủy bản ghi** xóa file đang ghi, không lưu/upload và không xóa bản ghi cũ.
 - Khi dừng/hủy, Live Activity được gỡ. Thời gian trên Activity không tính phần
   tạm dừng. Lệnh của Activity cũ không tác động tới phiên ghi mới.
 - Nếu tắt Live Activities trong Settings, app vẫn ghi âm nền; các nút điều khiển
   nằm trong app. Live Activity không thay thế quyền chạy audio nền.
 - Sau khi tạm dừng/dừng, iOS có thể treo app. Lệnh trực tiếp giữ background task
-  có giới hạn để xử lý lưu/upload. Upload từ lệnh Activity có timeout 20 giây,
-  sau đó lưu lỗi và đóng kết nối riêng để có thể upload lại khi mở app. Upload
-  dài hoặc mất mạng có thể cần thử lại; chưa triển khai upload nền `URLSession`.
+  có giới hạn để xử lý lưu file. Chia sẻ/upload được thực hiện trong app;
+  chưa triển khai upload nền `URLSession`.
 - iOS có thể ngắt audio khi có cuộc gọi, đổi thiết bị âm thanh hoặc đóng cưỡng
   bức app. Không đảm bảo tiếp tục ghi sau khi người dùng vuốt tắt app. Khi plugin
   báo tạm dừng/tiếp tục, Activity được đồng bộ trạng thái.

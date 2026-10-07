@@ -118,7 +118,7 @@ final class RecordingControl {
     defer { actionInFlight = false }
 
     // Pausing/stopping removes the audio background execution allowance.
-    // Keep the app alive while Dart saves the file and attempts its upload.
+    // Keep the app alive while Dart saves the recording locally.
     var taskId = UIBackgroundTaskIdentifier.invalid
     var completion: CheckedContinuation<Void, Error>?
     var timeout: DispatchWorkItem?
